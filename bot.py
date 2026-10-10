@@ -64,7 +64,6 @@ def init():
         )
     """)
     
-    # Owner bazada bormi tekshiramiz, bo'lmasa qo'shamiz
     exist_owner = q("SELECT id FROM users WHERE id=?", (OWNER,), "one")
     if not exist_owner:
         q("INSERT INTO users (id, name, status, role) VALUES (?, 'Owner', 'approved', 'admin')", (OWNER,))
@@ -147,12 +146,12 @@ async def cb_decide(c: CallbackQuery):
     act, uid = c.data.split(":")
     r, mark = await decide(int(uid), act)
     if not r:
-        return await c.answer()
+        return await c.answer("Пользователь не найден", show_alert=True)
     try:
         await c.message.edit_text(f"👤 {r['name']}\nID: {uid}\n\n{mark}")
     except TelegramBadRequest:
         pass
-    await c.answer()
+    await c.answer("Готово!")
 
 def menu(uid):
     rows = [
@@ -174,7 +173,6 @@ async def show(c, text, kb):
         await c.message.edit_text(text[:4000], reply_markup=kb)
     except TelegramBadRequest:
         pass
-    await c.answer()
 
 def pager(kind, rows, page, label, cb):
     pages = max(1, (len(rows) + PER - 1) // PER)
@@ -230,6 +228,7 @@ async def cb_menu(c: CallbackQuery):
     if not ok(c.from_user.id):
         return await c.answer("У вас нет доступа", show_alert=True)
     await show(c, "Главное меню:", menu(c.from_user.id))
+    await c.answer()
 
 @dp.callback_query(F.data == "list")
 async def cb_list(c: CallbackQuery):
@@ -243,6 +242,7 @@ async def cb_list(c: CallbackQuery):
     else:
         t = "Список пуст."
     await show(c, t, BACK)
+    await c.answer()
 
 @dp.callback_query(F.data.regexp(r"^(get|dl|us|adm_list):\d+$"))
 async def cb_pages(c: CallbackQuery):
@@ -252,6 +252,7 @@ async def cb_pages(c: CallbackQuery):
     if kind != "get" and not adm(c.from_user.id):
         return await c.answer("Нет доступа", show_alert=True)
     await render(c, kind, int(p))
+    await c.answer()
 
 @dp.callback_query(F.data.regexp(r"^gname:.+$"))
 async def cb_get_name(c: CallbackQuery):
@@ -267,13 +268,14 @@ async def cb_get_name(c: CallbackQuery):
             await bot.send_voice(chat_id=c.message.chat.id, voice=voices[0]["file_id"])
         else:
             await c.message.answer_voice(voices[0]["file_id"])
-        await c.answer()
+        await c.answer("🔊 Голосовое отправлено")
     else:
         kb_rows = []
         for idx, v in enumerate(voices, 1):
             kb_rows.append([B(text=f"🔊 Вариант {idx} ({v['dur']} сек)", callback_data=f"vid:{v['id']}")])
         kb_rows.append([B(text="⬅️ Назад", callback_data="get:0")])
         await show(c, f"🔊 Имя «{name}» имеет несколько вариантов:", M(inline_keyboard=kb_rows))
+        await c.answer()
 
 @dp.callback_query(F.data.regexp(r"^vid:\d+$"))
 async def cb_get_voice_id(c: CallbackQuery):
@@ -286,7 +288,7 @@ async def cb_get_voice_id(c: CallbackQuery):
             await bot.send_voice(chat_id=c.message.chat.id, voice=v["file_id"])
         else:
             await c.message.answer_voice(v["file_id"])
-        await c.answer("🔊 Вот голосовое:")
+        await c.answer("🔊 Голосовое отправлено")
     else:
         await c.answer("Этот вариант уже удален", show_alert=True)
 
@@ -297,6 +299,7 @@ async def cb_del_name(c: CallbackQuery):
     name = c.data.split(":", 1)[1]
     q("DELETE FROM voices WHERE LOWER(name)=?", (name.lower(),))
     await render(c, "dl", 0)
+    await c.answer("🗑 Удалено")
 
 async def card(c, uid):
     r = q("SELECT * FROM users WHERE id=?", (uid,), "one")
@@ -334,7 +337,8 @@ async def cb_user(c: CallbackQuery):
     uid = int(uid)
     
     if act == "u":
-        return await card(c, uid)
+        await card(c, uid)
+        return await c.answer()
     if act == "adm":
         if uid == OWNER:
             return await c.answer("Нельзя изменить статус владельца!", show_alert=True)
@@ -347,7 +351,8 @@ async def cb_user(c: CallbackQuery):
                 await bot.send_message(uid, msg, reply_markup=menu(uid))
             except Exception:
                 pass
-            return await card(c, uid)
+            await card(c, uid)
+            return await c.answer("Статус изменен")
     if act == "rm":
         if uid == OWNER:
             return await c.answer("Нельзя удалить владельца!", show_alert=True)
@@ -356,10 +361,12 @@ async def cb_user(c: CallbackQuery):
             await bot.send_message(uid, "🚫 Ваш доступ к боту закрыт.")
         except Exception:
             pass
-        return await render(c, "us", 0)
+        await render(c, "us", 0)
+        return await c.answer("Доступ закрыт")
     if act in ("cok", "coa", "cno"):
-        res, mark = await decide(uid, act[1:])
-        return await card(c, uid)
+        await decide(uid, act[1:])
+        await card(c, uid)
+        return await c.answer("Готово")
 
 @dp.callback_query(F.data.regexp(r"^(rp|rk|add):\d+$"))
 async def cb_conflict(c: CallbackQuery):
@@ -368,10 +375,6 @@ async def cb_conflict(c: CallbackQuery):
     
     p = q("SELECT * FROM pending_voices WHERE id=?", (pid,), "one")
     if not p:
-        try:
-            await c.message.edit_text("Запрос устарел.")
-        except TelegramBadRequest:
-            pass
         return await c.answer("Запрос устарел.", show_alert=True)
     
     if c.from_user.id != p["added_by"] and not adm(c.from_user.id):
@@ -395,7 +398,7 @@ async def cb_conflict(c: CallbackQuery):
         await c.message.edit_text(text)
     except TelegramBadRequest:
         pass
-    await c.answer()
+    await c.answer("Успешно!")
 
 @dp.message(CommandStart(), F.chat.type == "private")
 async def start(m: Message):
@@ -488,7 +491,7 @@ async def group(m: Message):
             
             kb_rows = []
             for idx, ex_v in enumerate(existing, 1):
-                kb_rows.append([B(text=f"🔊 Вариант {idx} ({ex_v['dur']} сек)", callback_data=f"vid:{ex_v['id']}")])
+                kb_rows.append([B(text=f"🔊 Слушать вариант {idx} ({ex_v['dur']} сек)", callback_data=f"vid:{ex_v['id']}")])
             
             kb_rows.append([
                 B(text="🔄 Заменить", callback_data=f"rp:{pid}"),
@@ -519,7 +522,7 @@ async def on_error(error_event: ErrorEvent):
 async def main():
     init()
     await bot.delete_webhook(drop_pending_updates=True)
-    await notify("🚀 Бoton запущен и работает.")
+    await notify("🚀 Бот запущен и работает.")
     try:
         await dp.start_polling(bot)
     except Exception as e:
