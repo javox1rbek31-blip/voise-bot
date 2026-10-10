@@ -131,7 +131,8 @@ async def decide(uid, act):
         return None, ""
     if act in ("ok", "oa"):
         role = "admin" if act == "oa" else "user"
-        q("UPDATE users status='approved', role=? WHERE id=?", (role, uid)) if "UPDATE users status" else q("UPDATE users SET status='approved', role=? WHERE id=?", (role, uid))
+        # Xatolik to'g'irlandi: SET so'zi qo'shildi
+        q("UPDATE users SET status='approved', role=? WHERE id=?", (role, uid))
         mark = "✅ Принят как админ" if role == "admin" else "✅ Принят"
         try:
             await bot.send_message(uid, "✅ Ваша заявка принята! Вы можете пользоваться ботом.", reply_markup=menu(uid))
@@ -324,7 +325,7 @@ async def card(c, uid):
             rows.append([B(text="🚫 Закрыть доступ", callback_data=f"rm:{uid}")])
         state = "главный владелец" if uid == OWNER else ("админ" if is_a else "пользователь")
     else:
-        rows = [[B(text="🔄 Открыть доступ", callback_data=f"cok:{uid}")]]
+        rows = [[B(text="🔄 Открыть доступ", callback_data=f"cok:{uid})]]
         state = "доступ закрыт"
     
     rows.append([B(text="⬅️ Назад", callback_data="us:0")])
