@@ -14,7 +14,7 @@ from aiogram.types import (
     ErrorEvent
 )
 
-TOKEN = os.environ.get("BOT_TOKEN", "8608877100:AAF9kNtDxRmtMwFjGlNGUT0Zi7X8mQ9AJOI").strip()
+TOKEN = os.environ["BOT_TOKEN"].strip()
 OWNER = int(os.environ.get("OWNER_ID", "8785896869"))
 DB = os.environ.get("DB_PATH", "/data/bot.db")
 PER = 8
