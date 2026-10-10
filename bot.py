@@ -131,7 +131,6 @@ async def decide(uid, act):
         return None, ""
     if act in ("ok", "oa"):
         role = "admin" if act == "oa" else "user"
-        # Xatolik to'g'irlandi: SET so'zi qo'shildi
         q("UPDATE users SET status='approved', role=? WHERE id=?", (role, uid))
         mark = "✅ Принят как админ" if role == "admin" else "✅ Принят"
         try:
@@ -325,7 +324,7 @@ async def card(c, uid):
             rows.append([B(text="🚫 Закрыть доступ", callback_data=f"rm:{uid}")])
         state = "главный владелец" if uid == OWNER else ("админ" if is_a else "пользователь")
     else:
-        rows = [[B(text="🔄 Открыть доступ", callback_data=f"cok:{uid})]]
+        rows = [[B(text="🔄 Открыть доступ", callback_data=f"cok:{uid}")]]
         state = "доступ закрыт"
     
     rows.append([B(text="⬅️ Назад", callback_data="us:0")])
@@ -434,105 +433,4 @@ async def private_any(m: Message):
     else:
         kb_rows = []
         for idx, v in enumerate(voices, 1):
-            kb_rows.append([B(text=f"🔊 Вариант {idx} ({v['dur']} сек)", callback_data=f"vid:{v['id']}")])
-        await m.answer(f"🔊 Найдено несколько вариантов для «{m.text.strip()}»:", reply_markup=M(inline_keyboard=kb_rows))
-
-# --- GURUH VA CHATLAR ---
-@dp.my_chat_member()
-async def added(ev: ChatMemberUpdated):
-    if ev.chat.type not in ("group", "supergroup"):
-        return
-    if ev.new_chat_member.status in ("member", "administrator") and ev.from_user.id == OWNER:
-        set_log(ev.chat.id)
-        await bot.send_message(
-            ev.chat.id,
-            "📌 Группа назначена главной: сюда приходят заявки и сообщения об ошибках.\n\n"
-            "🎤 Как сохранить голосовое: ответьте (reply) на голосовое сообщение и напишите имя.\n"
-            "🔊 Как получить: просто напишите имя.\n\nПанель управления:",
-            reply_markup=menu(OWNER)
-        )
-
-@dp.message(F.chat.type.in_(("group", "supergroup")), F.text)
-async def group(m: Message):
-    u = m.from_user
-    if not u or u.is_bot:
-        return
-    text = m.text.strip()
-    
-    if text.startswith("/"):
-        if u.id == OWNER and text.split()[0].split("@")[0].lower() == "/setgroup":
-            set_log(m.chat.id)
-            await m.reply("📌 Эта группа назначена главной.", reply_markup=menu(OWNER))
-        return
-    
-    r = m.reply_to_message
-    if r and r.voice:
-        if not ok(u.id):
-            await request_access(u)
-            return
-        
-        key = text.lower()
-        if not key or len(key) > 60:
-            return
-        
-        v = r.voice
-        existing = q("SELECT * FROM voices WHERE LOWER(key)=?", (key,))
-        
-        if not existing:
-            q("INSERT INTO voices (key, name, file_id, uid, dur, added_by) VALUES (?,?,?,?,?,?)",
-              (key, text, v.file_id, v.file_unique_id, v.duration, u.id))
-            await m.reply(f"✅ Сохранено: {text}")
-        else:
-            cur = sqlite3.connect(DB)
-            cur_exec = cur.cursor()
-            cur_exec.execute("""
-                INSERT INTO pending_voices (chat_id, message_id, key, name, file_id, uid, dur, added_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (m.chat.id, m.message_id, key, text, v.file_id, v.file_unique_id, v.duration, u.id))
-            cur.commit()
-            pid = cur_exec.lastrowid
-            cur.close()
-            
-            kb_rows = []
-            for idx, ex_v in enumerate(existing, 1):
-                kb_rows.append([B(text=f"▶️ Слушать вариант {idx} ({ex_v['dur']} сек)", callback_data=f"vid:{ex_v['id']}")])
-            
-            kb_rows.append([
-                B(text="🔄 Заменить", callback_data=f"rp:{pid}"),
-                B(text="➕ Сохранить как вариант", callback_data=f"add:{pid}")
-            ])
-            kb_rows.append([B(text="❌ Оставить прежнее", callback_data=f"rk:{pid}")])
-            
-            await m.reply(f"⚠️ Имя «{text}» уже занято. Вы можете прослушать существующие варианты или выбрать действие:", reply_markup=M(inline_keyboard=kb_rows))
-        return
-
-    if ok(u.id):
-        voices = q("SELECT * FROM voices WHERE LOWER(key)=? ORDER BY id", (text.lower(),))
-        if voices:
-            if len(voices) == 1:
-                await m.reply_voice(voices[0]["file_id"])
-            else:
-                kb_rows = []
-                for idx, v in enumerate(voices, 1):
-                    kb_rows.append([B(text=f"🔊 Вариант {idx} ({v['dur']} сек)", callback_data=f"vid:{v['id']}")])
-                await m.reply(f"🔊 Найдено несколько вариантов для «{text}»:", reply_markup=M(inline_keyboard=kb_rows))
-
-# --- XATOLIKLAR VA ISHGA TUSHIRISH ---
-@dp.error()
-async def on_error(error_event: ErrorEvent):
-    logging.exception("handler error", exc_info=error_event.exception)
-    await notify(f"⚠️ Ошибка в боте:\n{type(error_event.exception).__name__}: {error_event.exception}")
-    return True
-
-async def main():
-    init()
-    await bot.delete_webhook(drop_pending_updates=True)
-    await notify("🚀 Бот запущен и работает.")
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        await notify(f"🛑 Бот остановился из-за ошибки:\n{type(e).__name__}: {e}")
-        raise
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            kb_rows.append([B(text=f"🔊 Вариант {idx} ({v['dur']} сек)", callback_data=
