@@ -42,9 +42,19 @@ def init():
         os.makedirs(folder, exist_ok=True)
     q("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
     q("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, status TEXT, role TEXT)")
-    q("CREATE TABLE IF NOT EXISTS voices (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, name TEXT, file_id TEXT, uid TEXT, dur INTEGER, added_by INTEGER)")
+    # Ovozlar jadvali (bitta key ostida bir nechta variant bo'lishi uchun id avto-inkrement, key unique emas)
+    q("""
+        CREATE TABLE IF NOT EXISTS voices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            key TEXT, 
+            name TEXT, 
+            file_id TEXT, 
+            uid TEXT, 
+            dur INTEGER, 
+            added_by INTEGER
+        )
+    """)
     
-    # Owner har doim Bosh Admin qilib biriktiriladi
     q("""
         INSERT INTO users (id, name, status, role)
         VALUES (?, 'Owner', 'approved', 'admin')
@@ -190,13 +200,14 @@ async def render(c, kind, p):
         text = f"👑 Администраторы ({len(rows)}):"
         kb = pager("adm_list", rows, p, user_label, lambda r: f"u:{r['id']}")
     elif kind == "get":
-        rows = q("SELECT * FROM voices ORDER BY name")
+        # Har bir unikal nom bo'yicha guruhlaymiz
+        rows = q("SELECT DISTINCT name FROM voices ORDER BY name")
         text = f"🔊 Выберите имя ({len(rows)}):"
-        kb = pager("get", rows, p, lambda r: f"🔊 {r['name']} ({r['dur']} сек)", lambda r: f"g:{r['id']}")
+        kb = pager("get", rows, p, lambda r: f"🔊 {r['name']}", lambda r: f"gname:{r['name']}")
     else:
-        rows = q("SELECT * FROM voices ORDER BY name")
+        rows = q("SELECT DISTINCT name FROM voices ORDER BY name")
         text = f"🗑 Какое имя удалить? ({len(rows)})"
-        kb = pager("dl", rows, p, lambda r: f"❌ {r['name']}", lambda r: f"d:{r['id']}")
+        kb = pager("dl", rows, p, lambda r: f"❌ {r['name']}", lambda r: f"dname:{r['name']}")
     
     if not rows:
         text = "Список пуст."
@@ -219,7 +230,7 @@ async def cb_list(c: CallbackQuery):
         return await c.answer("У вас нет доступа", show_alert=True)
     rows = q("SELECT name, dur FROM voices ORDER BY name")
     if rows:
-        t = f"📜 Всего имён: {len(rows)}\n\n" + "\n".join(
+        t = f"📜 Всего записей: {len(rows)}\n\n" + "\n".join(
             f"{i}. {r['name']} — {r['dur']} сек" for i, r in enumerate(rows, 1)
         )
     else:
@@ -235,23 +246,44 @@ async def cb_pages(c: CallbackQuery):
         return await c.answer("Нет доступа", show_alert=True)
     await render(c, kind, int(p))
 
-@dp.callback_query(F.data.regexp(r"^g:\d+$"))
-async def cb_get(c: CallbackQuery):
+# Nom bosilganda variantlar ro'yxatini chiqarish (menyu yoki qidiruvdan)
+@dp.callback_query(F.data.regexp(r"^gname:.+$"))
+async def cb_get_name(c: CallbackQuery):
     if not ok(c.from_user.id):
         return await c.answer("У вас нет доступа", show_alert=True)
-    v = q("SELECT * FROM voices WHERE id=?", (int(c.data[2:]),), "one")
+    name = c.data.split(":", 1)[1]
+    voices = q("SELECT * FROM voices WHERE LOWER(name)=? ORDER BY id", (name.lower(),))
+    if not voices:
+        return await c.answer("Это имя удалено", show_alert=True)
+    
+    if len(voices) == 1:
+        await c.message.answer_voice(voices[0]["file_id"])
+        await c.answer()
+    else:
+        kb_rows = []
+        for idx, v in enumerate(voices, 1):
+            kb_rows.append([B(text=f"🔊 Вариант {idx} ({v['dur']} сек)", callback_data=f"vid:{v['id']}")])
+        kb_rows.append([B(text="⬅️ Назад", callback_data="get:0")])
+        await show(c, f"🔊 Имя «{name}» имеет несколько вариантов:", M(inline_keyboard=kb_rows))
+
+@dp.callback_query(F.data.regexp(r"^vid:\d+$"))
+async def cb_get_voice_id(c: CallbackQuery):
+    if not ok(c.from_user.id):
+        return await c.answer("У вас нет доступа", show_alert=True)
+    vid = int(c.data.split(":")[1])
+    v = q("SELECT file_id FROM voices WHERE id=?", (vid,), "one")
     if v:
-        # Caption-siz yuborish (toza audio)
         await c.message.answer_voice(v["file_id"])
         await c.answer()
     else:
-        await c.answer("Это имя уже удалено", show_alert=True)
+        await c.answer("Этот вариант уже удален", show_alert=True)
 
-@dp.callback_query(F.data.regexp(r"^d:\d+$"))
-async def cb_del(c: CallbackQuery):
+@dp.callback_query(F.data.regexp(r"^dname:.+$"))
+async def cb_del_name(c: CallbackQuery):
     if not adm(c.from_user.id):
         return await c.answer("Нет доступа", show_alert=True)
-    q("DELETE FROM voices WHERE id=?", (int(c.data[2:]),))
+    name = c.data.split(":", 1)[1]
+    q("DELETE FROM voices WHERE LOWER(name)=?", (name.lower(),))
     await render(c, "dl", 0)
 
 # --- USER CARD ---
@@ -318,12 +350,12 @@ async def cb_user(c: CallbackQuery):
         res, mark = await decide(uid, act[1:])
         return await card(c, uid)
 
-# --- OVOZLARNI ALMASHTIRISH ---
-@dp.callback_query(F.data.regexp(r"^(rp|rk):-?\d+:\d+$"))
-async def cb_replace(c: CallbackQuery):
+# --- OVOZLARNI ALMASHTIRISH / QO'SHISH ---
+@dp.callback_query(F.data.regexp(r"^(rp|rk|add):-?\d+:\d+$"))
+async def cb_conflict(c: CallbackQuery):
     act, chat_id, mid = c.data.split(":")
-    key = (int(chat_id), int(mid))
-    p = PENDING.get(key)
+    key_dict = (int(chat_id), int(mid))
+    p = PENDING.get(key_dict)
     if not p:
         try:
             await c.message.edit_text("Запрос устарел.")
@@ -334,11 +366,19 @@ async def cb_replace(c: CallbackQuery):
     if c.from_user.id != p["by"] and not adm(c.from_user.id):
         return await c.answer("Нет доступа", show_alert=True)
     
-    PENDING.pop(key, None)
+    PENDING.pop(key_dict, None)
+    
     if act == "rp":
-        q("UPDATE voices SET name=?, file_id=?, uid=?, dur=?, added_by=? WHERE key=?",
-          (p["name"], p["file_id"], p["uid"], p["dur"], p["by"], p["key"]))
+        # Eskisini o'chirib o'rniga yozish
+        q("DELETE FROM voices WHERE LOWER(key)=?", (p["key"],))
+        q("INSERT INTO voices (key, name, file_id, uid, dur, added_by) VALUES (?,?,?,?,?,?)",
+          (p["key"], p["name"], p["file_id"], p["uid"], p["dur"], p["by"]))
         text = f"🔄 Голосовое заменено: {p['name']}"
+    elif act == "add":
+        # Variant sifatida qo'shish
+        q("INSERT INTO voices (key, name, file_id, uid, dur, added_by) VALUES (?,?,?,?,?,?)",
+          (p["key"], p["name"], p["file_id"], p["uid"], p["dur"], p["by"]))
+        text = f"➕ Добавлен новый вариант для: {p['name']}"
     else:
         text = "Оставлено прежнее голосовое."
     
@@ -357,6 +397,13 @@ async def start(m: Message):
         await m.answer("⏳ Ваша заявка отправлена администраторам. Ожидайте подтверждения.")
         await request_access(m.from_user)
 
+@dp.message(F.chat.type == "private", F.voice)
+async def private_voice(m: Message):
+    if not ok(m.from_user.id):
+        await m.answer("⏳ У вас пока нет доступа к боту.")
+        return
+    await m.answer("🎤 Чтобы сохранить или заменить голос, отправьте голосовое сообщение в **главную группу** с ответом (reply) на него и напишите нужное имя.")
+
 @dp.message(F.chat.type == "private")
 async def private_any(m: Message):
     if not ok(m.from_user.id):
@@ -364,15 +411,18 @@ async def private_any(m: Message):
         return
 
     text = m.text.strip().lower()
+    voices = q("SELECT * FROM voices WHERE LOWER(key)=? ORDER BY id", (text,))
     
-    # Bazadan ismni qidirish
-    v = q("SELECT file_id FROM voices WHERE key=?", (text,), "one")
-    if v:
-        # Topilsa — tagida captionsiz toza voice yuboradi
-        await m.answer_voice(v["file_id"])
-    else:
-        # Topilmasa — rus tilida topilmadi deydi
+    if not voices:
         await m.answer("❌ Имя не найдено.")
+    elif len(voices) == 1:
+        await m.answer_voice(voices[0]["file_id"])
+    else:
+        # Agar bir nechta variant bo'lsa, tanlash uchun tugmalar chiqarish
+        kb_rows = []
+        for idx, v in enumerate(voices, 1):
+            kb_rows.append([B(text=f"🔊 Вариант {idx} ({v['dur']} сек)", callback_data=f"vid:{v['id']}")])
+        await m.answer(f"🔊 Найдено несколько вариантов для «{m.text.strip()}»:", reply_markup=M(inline_keyboard=kb_rows))
 
 # --- GURUH VA CHATLAR (OVOZ SAQLASH VA OLISH) ---
 @dp.my_chat_member()
@@ -413,30 +463,43 @@ async def group(m: Message):
             return
         
         v = r.voice
-        ex = q("SELECT uid FROM voices WHERE key=?", (key,), "one")
-        if not ex:
+        existing = q("SELECT * FROM voices WHERE LOWER(key)=?", (key,))
+        
+        if not existing:
             q("INSERT INTO voices (key, name, file_id, uid, dur, added_by) VALUES (?,?,?,?,?,?)",
               (key, text, v.file_id, v.file_unique_id, v.duration, u.id))
             await m.reply(f"✅ Сохранено: {text}")
-        elif ex["uid"] == v.file_unique_id:
-            await m.reply("ℹ️ Это голосовое уже сохранено под таким именем.")
         else:
+            # Konflikt: bu nom ostida allaqachon ovoz bor.
             PENDING[(m.chat.id, m.message_id)] = {
                 "key": key, "name": text, "file_id": v.file_id,
                 "uid": v.file_unique_id, "dur": v.duration, "by": u.id
             }
-            kb = M(inline_keyboard=[[
+            
+            # Eshitib ko'rish uchun eski variantlar tugmalari va boshqaruv tugmalari
+            kb_rows = []
+            for idx, ex_v in enumerate(existing, 1):
+                kb_rows.append([B(text=f"▶️ Слушать вариант {idx} ({ex_v['dur']} сек)", callback_data=f"vid:{ex_v['id']}")])
+            
+            kb_rows.append([
                 B(text="🔄 Заменить", callback_data=f"rp:{m.chat.id}:{m.message_id}"),
-                B(text="❌ Оставить прежнее", callback_data=f"rk:{m.chat.id}:{m.message_id}")
-            ]])
-            await m.reply(f"⚠️ Имя «{text}» уже занято. Заменить голосовое?", reply_markup=kb)
+                B(text="➕ Сохранить как вариант", callback_data=f"add:{m.chat.id}:{m.message_id}")
+            ])
+            kb_rows.append([B(text="❌ Оставить прежнее", callback_data=f"rk:{m.chat.id}:{m.message_id}")])
+            
+            await m.reply(f"⚠️ Имя «{text}» уже занято. Вы можете прослушать существующие варианты или выбрать действие:", reply_markup=M(inline_keyboard=kb_rows))
         return
 
     if ok(u.id):
-        v = q("SELECT file_id FROM voices WHERE key=?", (text.lower(),), "one")
-        if v:
-            # Captionsiz audio boradi
-            await m.reply_voice(v["file_id"])
+        voices = q("SELECT * FROM voices WHERE LOWER(key)=? ORDER BY id", (text.lower(),))
+        if voices:
+            if len(voices) == 1:
+                await m.reply_voice(voices[0]["file_id"])
+            else:
+                kb_rows = []
+                for idx, v in enumerate(voices, 1):
+                    kb_rows.append([B(text=f"🔊 Вариант {idx} ({v['dur']} сек)", callback_data=f"vid:{v['id']}")])
+                await m.reply(f"🔊 Найдено несколько вариантов для «{text}»:", reply_markup=M(inline_keyboard=kb_rows))
 
 # --- XATOLIKLAR VA ISHGA TUSHIRISH ---
 @dp.error()
