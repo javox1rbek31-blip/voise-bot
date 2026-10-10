@@ -359,10 +359,20 @@ async def start(m: Message):
 
 @dp.message(F.chat.type == "private")
 async def private_any(m: Message):
-    if ok(m.from_user.id):
-        await m.answer("Главное меню:", reply_markup=menu(m.from_user.id))
-    else:
+    if not ok(m.from_user.id):
         await m.answer("⏳ У вас пока нет доступа к боту. Ожидайте подтверждения.")
+        return
+
+    text = m.text.strip().lower()
+    
+    # Bazadan ismni qidirish
+    v = q("SELECT file_id FROM voices WHERE key=?", (text,), "one")
+    if v:
+        # Topilsa — tagida captionsiz toza voice yuboradi
+        await m.answer_voice(v["file_id"])
+    else:
+        # Topilmasa — rus tilida topilmadi deydi
+        await m.answer("❌ Имя не найдено.")
 
 # --- GURUH VA CHATLAR (OVOZ SAQLASH VA OLISH) ---
 @dp.my_chat_member()
