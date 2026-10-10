@@ -52,7 +52,6 @@ def init():
             added_by INTEGER
         )
     """)
-    # Vaqtincha yuklangan ovozlar uchun bufer jadvali (tugmalar muammosiz ishlashi uchun)
     q("""
         CREATE TABLE IF NOT EXISTS pending_voices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,7 +131,7 @@ async def decide(uid, act):
         return None, ""
     if act in ("ok", "oa"):
         role = "admin" if act == "oa" else "user"
-        q("UPDATE users SET status='approved', role=? WHERE id=?", (role, uid))
+        q("UPDATE users status='approved', role=? WHERE id=?", (role, uid)) if "UPDATE users status" else q("UPDATE users SET status='approved', role=? WHERE id=?", (role, uid))
         mark = "✅ Принят как админ" if role == "admin" else "✅ Принят"
         try:
             await bot.send_message(uid, "✅ Ваша заявка принята! Вы можете пользоваться ботом.", reply_markup=menu(uid))
@@ -366,7 +365,6 @@ async def cb_user(c: CallbackQuery):
         res, mark = await decide(uid, act[1:])
         return await card(c, uid)
 
-# --- OVOZLARNI ALMASHTIRISH / QO'SHISH (BAZA ORQALI TO'G'RILANDI) ---
 @dp.callback_query(F.data.regexp(r"^(rp|rk|add):\d+$"))
 async def cb_conflict(c: CallbackQuery):
     act, pid = c.data.split(":")
@@ -383,17 +381,14 @@ async def cb_conflict(c: CallbackQuery):
     if c.from_user.id != p["added_by"] and not adm(c.from_user.id):
         return await c.answer("Нет доступа", show_alert=True)
     
-    # Buferdan o'chiramiz
     q("DELETE FROM pending_voices WHERE id=?", (pid,))
     
     if act == "rp":
-        # Eskisini o'chirib o'rniga yangisini yozish
         q("DELETE FROM voices WHERE LOWER(key)=?", (p["key"],))
         q("INSERT INTO voices (key, name, file_id, uid, dur, added_by) VALUES (?,?,?,?,?,?)",
           (p["key"], p["name"], p["file_id"], p["uid"], p["dur"], p["added_by"]))
         text = f"🔄 Голосовое заменено: {p['name']}"
     elif act == "add":
-        # Variant sifatida qo'shish
         q("INSERT INTO voices (key, name, file_id, uid, dur, added_by) VALUES (?,?,?,?,?,?)",
           (p["key"], p["name"], p["file_id"], p["uid"], p["dur"], p["added_by"]))
         text = f"➕ Добавлен новый вариант для: {p['name']}"
@@ -487,7 +482,6 @@ async def group(m: Message):
               (key, text, v.file_id, v.file_unique_id, v.duration, u.id))
             await m.reply(f"✅ Сохранено: {text}")
         else:
-            # Ma'lumotlarni pending_voices jadvaliga yozamiz (bazaga tayanadi, hech qachon o'chib ketmaydi)
             cur = sqlite3.connect(DB)
             cur_exec = cur.cursor()
             cur_exec.execute("""
@@ -518,4 +512,26 @@ async def group(m: Message):
                 await m.reply_voice(voices[0]["file_id"])
             else:
                 kb_rows = []
-                for idx, v in enumerate(voices, 1
+                for idx, v in enumerate(voices, 1):
+                    kb_rows.append([B(text=f"🔊 Вариант {idx} ({v['dur']} сек)", callback_data=f"vid:{v['id']}")])
+                await m.reply(f"🔊 Найдено несколько вариантов для «{text}»:", reply_markup=M(inline_keyboard=kb_rows))
+
+# --- XATOLIKLAR VA ISHGA TUSHIRISH ---
+@dp.error()
+async def on_error(error_event: ErrorEvent):
+    logging.exception("handler error", exc_info=error_event.exception)
+    await notify(f"⚠️ Ошибка в боте:\n{type(error_event.exception).__name__}: {error_event.exception}")
+    return True
+
+async def main():
+    init()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await notify("🚀 Бот запущен и работает.")
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        await notify(f"🛑 Бот остановился из-за ошибки:\n{type(e).__name__}: {e}")
+        raise
+
+if __name__ == "__main__":
+    asyncio.run(main())
