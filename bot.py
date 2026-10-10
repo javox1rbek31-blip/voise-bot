@@ -2,220 +2,123 @@ import asyncio
 import logging
 import os
 import sqlite3
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    CallbackQuery,
+    ChatMemberUpdated,
+    InlineKeyboardButton as B,
+    InlineKeyboardMarkup as M,
+    Message,
+    ErrorEvent
+)
 
-# Настройки Telegram
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8608877100:AAF9kNtDxRmtMwFjGlNGUT0Zi7X8mQ9AJOI")
-OWNER_ID = int(os.getenv("OWNER_ID", "8785896869"))
-DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
+# Ma'lumotlar va Sozlamalar
+TOKEN = os.environ.get("BOT_TOKEN", "8608877100:AAF9kNtDxRmtMwFjGlNGUT0Zi7X8mQ9AJOI").strip()
+OWNER = int(os.environ.get("OWNER_ID", "8785896869"))
+DB = os.environ.get("DB_PATH", "/data/bot.db")
+PER = 8
+PENDING = {}  # Ovozli xabarni almashtirish uchun xotira
 
-bot = Bot(token=BOT_TOKEN)
+logging.basicConfig(level=logging.INFO)
+bot = Bot(TOKEN)
 dp = Dispatcher()
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ ---
-def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+# --- BAZA BILAN ISHLASH ---
+def q(sql, args=(), fetch="all"):
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    try:
+        cur = c.execute(sql, args)
+        c.commit()
+        return cur.fetchone() if fetch == "one" else cur.fetchall()
+    finally:
+        c.close()
+
+def init():
+    folder = os.path.dirname(DB)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    q("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
+    q("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, status TEXT, role TEXT)")
+    q("CREATE TABLE IF NOT EXISTS voices (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, name TEXT, file_id TEXT, uid TEXT, dur INTEGER, added_by INTEGER)")
     
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            username TEXT,
-            is_allowed INTEGER DEFAULT 0,
-            is_admin INTEGER DEFAULT 0
-        )
-    """)
-    
-    # Главный владелец (Owner) всегда имеет доступ и админку
-    cursor.execute("""
-        INSERT INTO users (user_id, full_name, username, is_allowed, is_admin)
-        VALUES (?, 'Owner', 'owner', 1, 1)
-        ON CONFLICT(user_id) DO UPDATE SET is_allowed = 1, is_admin = 1
-    """, (OWNER_ID,))
-    
-    conn.commit()
-    conn.close()
+    # Bot egasini avtomatik Bosh Admin va tasdiqlangan holatda saqlash
+    q("""
+        INSERT INTO users (id, name, status, role)
+        VALUES (?, 'Owner', 'approved', 'admin')
+        ON CONFLICT (id) DO UPDATE SET status='approved', role='admin'
+    """, (OWNER,))
 
-def is_admin(user_id: int) -> bool:
-    if user_id == OWNER_ID:
-        return True
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return bool(row and row[0] == 1)
+def get_log():
+    try:
+        r = q("SELECT v FROM settings WHERE k='log_chat'", (), "one")
+        return int(r["v"]) if r else None
+    except Exception:
+        return None
 
-def is_allowed(user_id: int) -> bool:
-    if user_id == OWNER_ID:
-        return True
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT is_allowed FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return bool(row and row[0] == 1)
+def set_log(chat_id):
+    q("INSERT INTO settings (k,v) VALUES('log_chat',?) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v", (str(chat_id),))
 
-def add_user(user_id: int, full_name: str, username: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO users (user_id, full_name, username)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET full_name=?, username=?
-    """, (user_id, full_name, username, full_name, username))
-    conn.commit()
-    conn.close()
-
-def set_access_status(user_id: int, status: int):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET is_allowed = ? WHERE user_id = ?", (status, user_id))
-    conn.commit()
-    conn.close()
-
-def set_admin_status(user_id: int, status: int):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET is_admin = ?, is_allowed = 1 WHERE user_id = ?", (status, user_id))
-    conn.commit()
-    conn.close()
-
-def get_all_users():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, full_name, username, is_allowed, is_admin FROM users")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-
-# --- ХЕНДЛЕРЫ ---
-
-@dp.message(CommandStart())
-async def start_handler(message: types.Message):
-    user_id = message.from_user.id
-    full_name = message.from_user.full_name
-    username = message.from_user.username or "нет"
-    
-    add_user(user_id, full_name, username)
-    
-    if is_admin(user_id):
-        keyboard = [
-            [InlineKeyboardButton(text="👥 Управление доступом", callback_data="manage_access")],
-            [InlineKeyboardButton(text="👑 Управление админами", callback_data="manage_admins")]
-        ]
-        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
-        await message.answer(f"Здравствуйте, {full_name}!\nВыберите действие в меню:", reply_markup=markup)
-        return
-
-    if not is_allowed(user_id):
-        await message.answer("У вас нет доступа к боту. Ожидайте подтверждения администратора.")
-        return
-
-    await message.answer(f"Здравствуйте, {full_name}! Бот готов к работе.")
-
-
-# 1. ГОЛОСОВЫЕ СООБЩЕНИЯ (Без названия/имени под аудио)
-@dp.message(F.voice)
-async def handle_voice(message: types.Message):
-    if not is_allowed(message.from_user.id):
-        await message.answer("У вас нет доступа к боту.")
-        return
-
-    # Отправляем чистое голосовое сообщение без подписи
-    await message.answer_voice(voice=message.voice.file_id)
-
-
-# 2. КНОПКА 1: УПРАВЛЕНИЕ ДОСТУПОМ К БОТУ
-@dp.callback_query(F.data == "manage_access")
-async def manage_access_callback(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("У вас нет прав администратора!", show_alert=True)
-        return
-
-    users = get_all_users()
-    keyboard = []
-    text = "<b>👥 Управление доступом пользователей:</b>\n\n"
-    
-    for uid, fname, uname, allowed, admin_flag in users:
-        if uid == OWNER_ID:
+async def notify(text, kb=None):
+    for t in [get_log(), OWNER]:
+        if t is None:
             continue
-        status_text = "✅ Разрешено" if allowed else "❌ Запрещено"
-        text += f"• {fname} (@{uname}) — {status_text}\n"
-        
-        btn_text = f"🚫 Закрыть доступ: {fname}" if allowed else f"✅ Открыть доступ: {fname}"
-        action = f"deny_acc_{uid}" if allowed else f"allow_acc_{uid}"
-        keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=action)])
+        try:
+            await bot.send_message(t, text[:4000], reply_markup=kb)
+            return
+        except Exception:
+            logging.exception("notify failed")
 
-    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="manage_access")])
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+def ok(uid):
+    if uid == OWNER:
+        return True
+    r = q("SELECT status FROM users WHERE id=?", (uid,), "one")
+    return bool(r and r["status"] == "approved")
 
-@dp.callback_query(F.data.startswith("allow_acc_"))
-async def allow_access(callback: types.CallbackQuery):
-    target_id = int(callback.data.split("_")[2])
-    set_access_status(target_id, 1)
-    await callback.answer("Доступ предоставлен!", show_alert=True)
-    await manage_access_callback(callback)
+def adm(uid):
+    if uid == OWNER:
+        return True
+    r = q("SELECT status, role FROM users WHERE id=?", (uid,), "one")
+    return bool(r and r["status"] == "approved" and r["role"] == "admin")
 
-@dp.callback_query(F.data.startswith("deny_acc_"))
-async def deny_access(callback: types.CallbackQuery):
-    target_id = int(callback.data.split("_")[2])
-    set_access_status(target_id, 0)
-    await callback.answer("Доступ закрыт!", show_alert=True)
-    await manage_access_callback(callback)
+def uname(u):
+    return u.full_name + (f" (@{u.username})" if u.username else "")
 
+# --- ZAYAVKALAR ---
+def req_kb(uid):
+    return M(inline_keyboard=[
+        [
+            B(text="✅ Принять", callback_data=f"ok:{uid}"),
+            B(text="👑 Принять как админа", callback_data=f"oa:{uid}"),
+        ],
+        [B(text="❌ Отклонить", callback_data=f"no:{uid}")],
+    ])
 
-# 3. КНОПКА 2: УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ
-@dp.callback_query(F.data == "manage_admins")
-async def manage_admins_callback(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("У вас нет прав администратора!", show_alert=True)
+async def request_access(u):
+    if u.id == OWNER:
         return
+    if q("SELECT 1 FROM users WHERE id=?", (u.id,), "one"):
+        return
+    q("INSERT INTO users (id, name, status, role) VALUES (?, ?, 'pending', 'user')", (u.id, uname(u)))
+    await notify(f"📩 Новый пользователь запрашивает доступ:\n{uname(u)}\nID: {u.id}", kb=req_kb(u.id))
 
-    users = get_all_users()
-    keyboard = []
-    text = "<b>👑 Управление администраторами:</b>\n\n"
-    
-    for uid, fname, uname, allowed, admin_flag in users:
-        if uid == OWNER_ID:
-            text += f"• {fname} (@{uname}) — 👑 Главный владелец\n"
-            continue
-            
-        role_text = "⭐ Админ" if admin_flag else "👤 Пользователь"
-        text += f"• {fname} (@{uname}) — {role_text}\n"
-        
-        btn_text = f"❌ Снять админку: {fname}" if admin_flag else f"➕ Назначить админом: {fname}"
-        action = f"demote_adm_{uid}" if admin_flag else f"promote_adm_{uid}"
-        keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=action)])
+async def decide(uid, act):
+    r = q("SELECT * FROM users WHERE id=?", (uid,), "one")
+    if not r:
+        return None, ""
+    if act in ("ok", "oa"):
+        role = "admin" if act == "oa" else "user"
+        q("UPDATE users SET status='approved', role=? WHERE id=?", (role, uid))
+        mark = "✅ Принят как админ" if role == "admin" else "✅ Принят"
+        try:
+            await bot.send_message(uid, "Ваша заявка принята.", reply_markup=menu(uid))
+        except Exception:
+            mark += "\n⚠️ Пользователь ещё не открывал бота (пусть нажмёт /start)"
+    else:
+        q("UPDATE users SET status='rejected', role='user' WHERE id=?", (uid,))
+        mark = "❌ Отклонён"
+    return r, mark
 
-    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="manage_admins")])
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-
-@dp.callback_query(F.data.startswith("promote_adm_"))
-async def promote_admin(callback: types.CallbackQuery):
-    target_id = int(callback.data.split("_")[2])
-    set_admin_status(target_id, 1)
-    await callback.answer("Пользователь назначен админом!", show_alert=True)
-    await manage_admins_callback(callback)
-
-@dp.callback_query(F.data.startswith("demote_adm_"))
-async def demote_admin(callback: types.CallbackQuery):
-    target_id = int(callback.data.split("_")[2])
-    set_admin_status(target_id, 0)
-    await callback.answer("Админские права сняты!", show_alert=True)
-    await manage_admins_callback(callback)
-
-
-# ЗАПУСК БОТА
-async def main():
-    init_db()
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+@dp.callback_query(F.data
