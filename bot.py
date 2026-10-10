@@ -2,427 +2,239 @@ import asyncio
 import logging
 import os
 import sqlite3
-from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    CallbackQuery,
-    ChatMemberUpdated,
-    InlineKeyboardButton as B,
-    InlineKeyboardMarkup as M,
-    Message,
-    ErrorEvent
-)
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-TOKEN = os.environ.get("BOT_TOKEN", "8608877100:AAF9kNtDxRmtMwFjGlNGUT0Zi7X8mQ9AJOI").strip()
-OWNER = int(os.environ.get("OWNER_ID", "8785896869"))
-DB = os.environ.get("DB_PATH", "/data/bot.db")
-PER = 8
-PENDING = {}
+# Настройки Telegram
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8608877100:AAF9kNtDxRmtMwFjGlNGUT0Zi7X8mQ9AJOI")
+OWNER_ID = int(os.getenv("OWNER_ID", "8785896869"))
+DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- BAZA BILAN ISHLASH ---
-def q(sql, args=(), fetch="all"):
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    try:
-        cur = c.execute(sql, args)
-        c.commit()
-        return cur.fetchone() if fetch == "one" else cur.fetchall()
-    finally:
-        c.close()
-
-def init():
-    folder = os.path.dirname(DB)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-    q("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
-    q("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, status TEXT, role TEXT)")
-    q("CREATE TABLE IF NOT EXISTS voices (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, name TEXT, file_id TEXT, uid TEXT, dur INTEGER, added_by INTEGER)")
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    # Bot egasini (Owner) har doim tasdiqlangan Admin qilib saqlash
-    q("""
-        INSERT INTO users (id, name, status, role)
-        VALUES (?, 'Owner', 'approved', 'admin')
-        ON CONFLICT (id) DO UPDATE SET status='approved', role='admin'
-    """, (OWNER,))
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            username TEXT,
+            is_allowed INTEGER DEFAULT 0,
+            is_admin INTEGER DEFAULT 0
+        )
+    """)
+    
+    # Главный владелец (Owner) всегда имеет доступ и админку
+    cursor.execute("""
+        INSERT INTO users (user_id, full_name, username, is_allowed, is_admin)
+        VALUES (?, 'Owner', 'owner', 1, 1)
+        ON CONFLICT(user_id) DO UPDATE SET is_allowed = 1, is_admin = 1
+    """, (OWNER_ID,))
+    
+    conn.commit()
+    conn.close()
 
-def get_log():
-    try:
-        r = q("SELECT v FROM settings WHERE k='log_chat'", (), "one")
-        return int(r["v"]) if r else None
-    except Exception:
-        return None
+def is_admin(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row and row[0] == 1)
 
-def set_log(chat_id):
-    q("INSERT INTO settings (k,v) VALUES('log_chat',?) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v", (str(chat_id),))
+def is_allowed(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_allowed FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row and row[0] == 1)
 
-async def notify(text, kb=None):
-    for t in [get_log(), OWNER]:
-        if t is None:
+def add_user(user_id: int, full_name: str, username: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    if user_id == OWNER_ID:
+        cursor.execute("""
+            INSERT INTO users (user_id, full_name, username, is_allowed, is_admin)
+            VALUES (?, ?, ?, 1, 1)
+            ON CONFLICT(user_id) DO UPDATE SET full_name=?, username=?, is_allowed=1, is_admin=1
+        """, (user_id, full_name, username, full_name, username))
+    else:
+        cursor.execute("""
+            INSERT INTO users (user_id, full_name, username)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET full_name=?, username=?
+        """, (user_id, full_name, username, full_name, username))
+    conn.commit()
+    conn.close()
+
+def set_access_status(user_id: int, status: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET is_allowed = ? WHERE user_id = ?", (status, user_id))
+    conn.commit()
+    conn.close()
+
+def set_admin_status(user_id: int, status: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET is_admin = ?, is_allowed = 1 WHERE user_id = ?", (status, user_id))
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, full_name, username, is_allowed, is_admin FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+# --- ХЕНДЛЕРЫ ---
+
+@dp.message(CommandStart())
+async def start_handler(message: types.Message):
+    user_id = message.from_user.id
+    full_name = message.from_user.full_name
+    username = message.from_user.username or "нет"
+    
+    add_user(user_id, full_name, username)
+    
+    if is_admin(user_id):
+        keyboard = [
+            [InlineKeyboardButton(text="👥 Управление доступом", callback_data="manage_access")],
+            [InlineKeyboardButton(text="👑 Управление админами", callback_data="manage_admins")]
+        ]
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        await message.answer(f"Здравствуйте, {full_name}!\nВыберите действие в меню:", reply_markup=markup)
+        return
+
+    if not is_allowed(user_id):
+        await message.answer("У вас нет доступа к боту. Ожидайте подтверждения администратора.")
+        return
+
+    await message.answer(f"Здравствуйте, {full_name}! Бот готов к работе.")
+
+
+# 1. ГОЛОСОВЫЕ СООБЩЕНИЯ (Без названия/имени под аудио)
+@dp.message(F.voice)
+async def handle_voice(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        await message.answer("У вас нет доступа к боту.")
+        return
+
+    # Отправляем чистое голосовое сообщение без подписи
+    await message.answer_voice(voice=message.voice.file_id)
+
+
+# 2. КНОПКА 1: УПРАВЛЕНИЕ ДОСТУПОМ К БОТУ
+@dp.callback_query(F.data == "manage_access")
+async def manage_access_callback(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("У вас нет прав администратора!", show_alert=True)
+        return
+
+    users = get_all_users()
+    keyboard = []
+    text = "<b>👥 Управление доступом пользователей:</b>\n\n"
+    
+    for uid, fname, uname, allowed, admin_flag in users:
+        if uid == OWNER_ID:
             continue
-        try:
-            await bot.send_message(t, text[:4000], reply_markup=kb)
-            return
-        except Exception:
-            logging.exception("notify failed")
-
-def ok(uid):
-    if uid == OWNER:
-        return True
-    r = q("SELECT status FROM users WHERE id=?", (uid,), "one")
-    return bool(r and r["status"] == "approved")
-
-def adm(uid):
-    if uid == OWNER:
-        return True
-    r = q("SELECT status, role FROM users WHERE id=?", (uid,), "one")
-    return bool(r and r["status"] == "approved" and r["role"] == "admin")
-
-def uname(u):
-    return u.full_name + (f" (@{u.username})" if u.username else "")
-
-# --- ZAYAVKALAR ---
-def req_kb(uid):
-    return M(inline_keyboard=[
-        [
-            B(text="✅ Принять", callback_data=f"ok:{uid}"),
-            B(text="👑 Принять как админа", callback_data=f"oa:{uid}"),
-        ],
-        [B(text="❌ Отклонить", callback_data=f"no:{uid}")],
-    ])
-
-async def request_access(u):
-    if u.id == OWNER:
-        return
-    if q("SELECT 1 FROM users WHERE id=?", (u.id,), "one"):
-        return
-    q("INSERT INTO users (id, name, status, role) VALUES (?, ?, 'pending', 'user')", (u.id, uname(u)))
-    await notify(f"📩 Новый пользователь запрашивает доступ:\n{uname(u)}\nID: {u.id}", kb=req_kb(u.id))
-
-async def decide(uid, act):
-    r = q("SELECT * FROM users WHERE id=?", (uid,), "one")
-    if not r:
-        return None, ""
-    if act in ("ok", "oa"):
-        role = "admin" if act == "oa" else "user"
-        q("UPDATE users SET status='approved', role=? WHERE id=?", (role, uid))
-        mark = "✅ Принят как админ" if role == "admin" else "✅ Принят"
-        try:
-            # Foydalanuvchiga tasdiqlash xabari va menyu boradi
-            await bot.send_message(uid, "Ваша заявка принята.", reply_markup=menu(uid))
-        except Exception:
-            mark += "\n⚠️ Пользователь ещё не открывал бота (пусть нажмёт /start)"
-    else:
-        q("UPDATE users SET status='rejected', role='user' WHERE id=?", (uid,))
-        mark = "❌ Отклонён"
-    return r, mark
-
-@dp.callback_query(F.data.regexp(r"^(ok|oa|no):\d+$"))
-async def cb_decide(c: CallbackQuery):
-    if not adm(c.from_user.id):
-        return await c.answer("Нет доступа", show_alert=True)
-    act, uid = c.data.split(":")
-    r, mark = await decide(int(uid), act)
-    if not r:
-        return await c.answer()
-    try:
-        await c.message.edit_text(f"👤 {r['name']}\nID: {uid}\n\n{mark}")
-    except TelegramBadRequest:
-        pass
-    await c.answer()
-
-# --- MENU VA TUGMALAR ---
-def menu(uid):
-    rows = [
-        [B(text="📜 Список имён", callback_data="list")],
-        [B(text="🔊 Получить голосовое", callback_data="get:0")],
-    ]
-    if adm(uid):
-        rows += [
-            [B(text="🗑 Удалить имя", callback_data="dl:0")],
-            [B(text="👥 Пользователи", callback_data="us:0")],
-        ]
-    return M(inline_keyboard=rows)
-
-BACK = M(inline_keyboard=[[B(text="⬅️ Назад", callback_data="menu")]])
-
-async def show(c, text, kb):
-    try:
-        await c.message.edit_text(text[:4000], reply_markup=kb)
-    except TelegramBadRequest:
-        pass
-    await c.answer()
-
-def pager(kind, rows, page, label, cb):
-    pages = max(1, (len(rows) + PER - 1) // PER)
-    page = min(max(page, 0), pages - 1)
-    kb = [[B(text=label(r), callback_data=cb(r))] for r in rows[page * PER : (page + 1) * PER]]
-    nav = []
-    if page > 0:
-        nav.append(B(text="⬅️", callback_data=f"{kind}:{page - 1}"))
-    nav.append(B(text=f"{page + 1}/{pages}", callback_data="noop"))
-    if page < pages - 1:
-        nav.append(B(text="➡️", callback_data=f"{kind}:{page + 1}"))
-    if nav:
-        kb.append(nav)
-    kb.append([B(text="⬅️ Назад", callback_data="menu")])
-    return M(inline_keyboard=kb)
-
-ICON = {"pending": "⏳ ", "rejected": "🚫 "}
-
-def user_label(r):
-    if r["status"] == "approved":
-        return ("👑 " if r["role"] == "admin" else "👤 ") + r["name"]
-    return ICON.get(r["status"], "") + r["name"]
-
-async def render(c, kind, p):
-    if kind == "us":
-        rows = q("SELECT * FROM users ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'approved' THEN 2 ELSE 3 END, name")
-        text = f"👥 Пользователей: {len(rows)}"
-        kb = pager("us", rows, p, user_label, lambda r: f"u:{r['id']}")
-    elif kind == "get":
-        rows = q("SELECT * FROM voices ORDER BY name")
-        text = f"🔊 Выберите имя ({len(rows)}):"
-        kb = pager("get", rows, p, lambda r: f"🔊 {r['name']} ({r['dur']} сек)", lambda r: f"g:{r['id']}")
-    else:
-        rows = q("SELECT * FROM voices ORDER BY name")
-        text = f"🗑 Какое имя удалить? ({len(rows)})"
-        kb = pager("dl", rows, p, lambda r: f"❌ {r['name']}", lambda r: f"d:{r['id']}")
-    
-    if not rows:
-        text = "Список пуст."
-        kb = BACK
-    await show(c, text, kb)
-
-@dp.callback_query(F.data == "noop")
-async def cb_noop(c: CallbackQuery):
-    await c.answer()
-
-@dp.callback_query(F.data == "menu")
-async def cb_menu(c: CallbackQuery):
-    if not ok(c.from_user.id):
-        return await c.answer()
-    await show(c, "Главное меню:", menu(c.from_user.id))
-
-@dp.callback_query(F.data == "list")
-async def cb_list(c: CallbackQuery):
-    if not ok(c.from_user.id):
-        return await c.answer()
-    rows = q("SELECT name, dur FROM voices ORDER BY name")
-    if rows:
-        t = f"📜 Всего имён: {len(rows)}\n\n" + "\n".join(
-            f"{i}. {r['name']} — {r['dur']} сек" for i, r in enumerate(rows, 1)
-        )
-    else:
-        t = "Список пуст."
-    await show(c, t, BACK)
-
-@dp.callback_query(F.data.regexp(r"^(get|dl|us):\d+$"))
-async def cb_pages(c: CallbackQuery):
-    kind, p = c.data.split(":")
-    if not ok(c.from_user.id):
-        return await c.answer()
-    if kind != "get" and not adm(c.from_user.id):
-        return await c.answer("Нет доступа", show_alert=True)
-    await render(c, kind, int(p))
-
-@dp.callback_query(F.data.regexp(r"^g:\d+$"))
-async def cb_get(c: CallbackQuery):
-    if not ok(c.from_user.id):
-        return await c.answer()
-    v = q("SELECT * FROM voices WHERE id=?", (int(c.data[2:]),), "one")
-    if v:
-        # Caption olib tashlandi — faqat audio boradi
-        await c.message.answer_voice(v["file_id"])
-        await c.answer()
-    else:
-        await c.answer("Это имя уже удалено", show_alert=True)
-
-@dp.callback_query(F.data.regexp(r"^d:\d+$"))
-async def cb_del(c: CallbackQuery):
-    if not adm(c.from_user.id):
-        return await c.answer("Нет доступа", show_alert=True)
-    q("DELETE FROM voices WHERE id=?", (int(c.data[2:]),))
-    await render(c, "dl", 0)
-
-# --- USER CARD ---
-async def card(c, uid):
-    r = q("SELECT * FROM users WHERE id=?", (uid,), "one")
-    if not r:
-        return await render(c, "us", 0)
-    st = r["status"]
-    if st == "pending":
-        rows = [
-            [
-                B(text="✅ Принять", callback_data=f"cok:{uid}"),
-                B(text="👑 Принять как админа", callback_data=f"coa:{uid}"),
-            ],
-            [B(text="❌ Отклонить", callback_data=f"cno:{uid}")],
-        ]
-        state = "ожидает решения"
-    elif st == "approved":
-        is_a = r["role"] == "admin"
-        rows = [
-            [B(text="👤 Снять админа" if is_a else "👑 Сделать админом", callback_data=f"adm:{uid}")],
-            [B(text="🚫 Удалить пользователя", callback_data=f"rm:{uid}")],
-        ]
-        state = "админ" if is_a else "пользователь"
-    else:
-        rows = [[B(text="🔄 Вернуть доступ", callback_data=f"cok:{uid}")]]
-        state = "доступ закрыт"
-    
-    rows.append([B(text="⬅️ Назад", callback_data="us:0")])
-    await show(c, f"👤 {r['name']}\nID: {uid}\nСтатус: {state}", M(inline_keyboard=rows))
-
-@dp.callback_query(F.data.regexp(r"^(u|adm|rm|cok|coa|cno):\d+$"))
-async def cb_user(c: CallbackQuery):
-    if not adm(c.from_user.id):
-        return await c.answer("Нет доступа", show_alert=True)
-    act, uid = c.data.split(":")
-    uid = int(uid)
-    
-    if act == "u":
-        return await card(c, uid)
-    if act == "adm":
-        r = q("SELECT role FROM users WHERE id=?", (uid,), "one")
-        if r:
-            q("UPDATE users SET role=? WHERE id=?", ("user" if r["role"] == "admin" else "admin", uid))
-            return await card(c, uid)
-    if act == "rm":
-        q("UPDATE users SET status='rejected', role='user' WHERE id=?", (uid,))
-        return await render(c, "us", 0)
-    if act in ("cok", "coa", "cno"):
-        res, mark = await decide(uid, act[1:])
-        if "⚠️" in mark:
-            await c.message.answer(f"{res['name']}: пользователь ещё не открывал бота.")
-        return await card(c, uid)
-
-# --- OVOZLARNI ALMASHTIRISH ---
-@dp.callback_query(F.data.regexp(r"^(rp|rk):-?\d+:\d+$"))
-async def cb_replace(c: CallbackQuery):
-    act, chat_id, mid = c.data.split(":")
-    key = (int(chat_id), int(mid))
-    p = PENDING.get(key)
-    if not p:
-        try:
-            await c.message.edit_text("Запрос устарел.")
-        except TelegramBadRequest:
-            pass
-        return await c.answer()
-    
-    if c.from_user.id != p["by"] and not adm(c.from_user.id):
-        return await c.answer("Нет доступа", show_alert=True)
-    
-    PENDING.pop(key, None)
-    if act == "rp":
-        q("UPDATE voices SET name=?, file_id=?, uid=?, dur=?, added_by=? WHERE key=?",
-          (p["name"], p["file_id"], p["uid"], p["dur"], p["by"], p["key"]))
-        text = f"🔄 Голосовое заменено: {p['name']}"
-    else:
-        text = "Оставлено прежнее голосовое."
-    
-    try:
-        await c.message.edit_text(text)
-    except TelegramBadRequest:
-        pass
-    await c.answer()
-
-# --- SHAXSIY CHAT ---
-@dp.message(CommandStart(), F.chat.type == "private")
-async def start(m: Message):
-    if ok(m.from_user.id):
-        await m.answer("Главное меню:", reply_markup=menu(m.from_user.id))
-    else:
-        await request_access(m.from_user)
-
-@dp.message(F.chat.type == "private")
-async def private_any(m: Message):
-    if ok(m.from_user.id):
-        await m.answer("Главное меню:", reply_markup=menu(m.from_user.id))
-
-# --- GURUH VA CHATLAR ---
-@dp.my_chat_member()
-async def added(ev: ChatMemberUpdated):
-    if ev.chat.type not in ("group", "supergroup"):
-        return
-    if ev.new_chat_member.status in ("member", "administrator") and ev.from_user.id == OWNER:
-        set_log(ev.chat.id)
-        await bot.send_message(
-            ev.chat.id,
-            "📌 Группа назначена главной: сюда приходят заявки и сообщения об ошибках.\n\n"
-            "🎤 Как сохранить голосовое: ответьте (reply) на голосовое сообщение и напишите имя.\n"
-            "🔊 Как получить: просто напишите имя.\n\nПанель управления:",
-            reply_markup=menu(OWNER)
-        )
-
-@dp.message(F.chat.type.in_(("group", "supergroup")), F.text)
-async def group(m: Message):
-    u = m.from_user
-    if not u or u.is_bot:
-        return
-    text = m.text.strip()
-    
-    if text.startswith("/"):
-        if u.id == OWNER and text.split()[0].split("@")[0].lower() == "/setgroup":
-            set_log(m.chat.id)
-            await m.reply("📌 Эта группа назначена главной.", reply_markup=menu(OWNER))
-        return
-    
-    r = m.reply_to_message
-    if r and r.voice:
-        if not ok(u.id):
-            await request_access(u)
-            return
+        status_text = "✅ Разрешено" if allowed else "❌ Запрещено"
+        text += f"• {fname} (@{uname}) — {status_text}\n"
         
-        key = text.lower()
-        if not key or len(key) > 60:
-            return
+        btn_text = f"🚫 Закрыть доступ: {fname}" if allowed else f"✅ Открыть доступ: {fname}"
+        action = f"deny_acc_{uid}" if allowed else f"allow_acc_{uid}"
+        keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=action)])
+
+    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="manage_access")])
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+@dp.callback_query(F.data.startswith("allow_acc_"))
+async def allow_access(callback: types.CallbackQuery):
+    target_id = int(callback.data.split("_")[2])
+    set_access_status(target_id, 1)
+    await callback.answer("Доступ предоставлен!", show_alert=True)
+    
+    try:
+        await bot.send_message(target_id, "✅ Вам предоставлен доступ к боту!")
+    except Exception:
+        pass
         
-        v = r.voice
-        ex = q("SELECT uid FROM voices WHERE key=?", (key,), "one")
-        if not ex:
-            q("INSERT INTO voices (key, name, file_id, uid, dur, added_by) VALUES (?,?,?,?,?,?)",
-              (key, text, v.file_id, v.file_unique_id, v.duration, u.id))
-            await m.reply(f"✅ Сохранено: {text}")
-        elif ex["uid"] == v.file_unique_id:
-            await m.reply("ℹ️ Это голосовое уже сохранено под таким именем.")
-        else:
-            PENDING[(m.chat.id, m.message_id)] = {
-                "key": key, "name": text, "file_id": v.file_id,
-                "uid": v.file_unique_id, "dur": v.duration, "by": u.id
-            }
-            kb = M(inline_keyboard=[[
-                B(text="🔄 Заменить", callback_data=f"rp:{m.chat.id}:{m.message_id}"),
-                B(text="❌ Оставить прежнее", callback_data=f"rk:{m.chat.id}:{m.message_id}")
-            ]])
-            await m.reply(f"⚠️ Имя «{text}» уже занято. Заменить голосовое?", reply_markup=kb)
+    await manage_access_callback(callback)
+
+@dp.callback_query(F.data.startswith("deny_acc_"))
+async def deny_access(callback: types.CallbackQuery):
+    target_id = int(callback.data.split("_")[2])
+    set_access_status(target_id, 0)
+    await callback.answer("Доступ закрыт!", show_alert=True)
+    await manage_access_callback(callback)
+
+
+# 3. КНОПКА 2: УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ
+@dp.callback_query(F.data == "manage_admins")
+async def manage_admins_callback(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("У вас нет прав администратора!", show_alert=True)
         return
 
-    if ok(u.id):
-        v = q("SELECT file_id FROM voices WHERE key=?", (text.lower(),), "one")
-        if v:
-            # Caption olib tashlandi — faqat audio boradi
-            await m.reply_voice(v["file_id"])
+    users = get_all_users()
+    keyboard = []
+    text = "<b>👑 Управление администраторами:</b>\n\n"
+    
+    for uid, fname, uname, allowed, admin_flag in users:
+        if uid == OWNER_ID:
+            text += f"• {fname} (@{uname}) — 👑 Главный владелец\n"
+            continue
+            
+        role_text = "⭐ Админ" if admin_flag else "👤 Пользователь"
+        text += f"• {fname} (@{uname}) — {role_text}\n"
+        
+        btn_text = f"❌ Снять админку: {fname}" if admin_flag else f"➕ Назначить админом: {fname}"
+        action = f"demote_adm_{uid}" if admin_flag else f"promote_adm_{uid}"
+        keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=action)])
 
-# --- XATOLIKLAR VA ISHGA TUSHIRISH ---
-@dp.error()
-async def on_error(event: ErrorEvent):
-    logging.exception("handler error", exc_info=event.exception)
-    await notify(f"⚠️ Ошибка в боте:\n{type(event.exception).__name__}: {event.exception}")
-    return True
+    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="manage_admins")])
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
+@dp.callback_query(F.data.startswith("promote_adm_"))
+async def promote_admin(callback: types.CallbackQuery):
+    target_id = int(callback.data.split("_")[2])
+    set_admin_status(target_id, 1)
+    await callback.answer("Пользователь назначен админом!", show_alert=True)
+    
+    try:
+        await bot.send_message(target_id, "👑 Вам предоставлены права администратора!")
+    except Exception:
+        pass
+        
+    await manage_admins_callback(callback)
+
+@dp.callback_query(F.data.startswith("demote_adm_"))
+async def demote_admin(callback: types.CallbackQuery):
+    target_id = int(callback.data.split("_")[2])
+    set_admin_status(target_id, 0)
+    await callback.answer("Админские права сняты!", show_alert=True)
+    await manage_admins_callback(callback)
+
+
+# ЗАПУСК БОТА
 async def main():
-    init()
-    await notify("🚀 Бот запущен и работает.")
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        await notify(f"🛑 Бот остановился из-за ошибки:\n{type(e).__name__}: {e}")
-        raise
+    init_db()
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
